@@ -1,157 +1,164 @@
-PgBouncer
-=========
+PgBouncer RW/RO Routing 확장 기능 (운영 가이드)
+===========================================
 
-Lightweight connection pooler for PostgreSQL.
+개요
+----
 
-Homepage: <https://www.pgbouncer.org/>
+본 PgBouncer는 기본 upstream 기능에 더해 아래 기능이 추가된 커스텀 버전입니다.
 
-Sources, bug tracking: <https://github.com/pgbouncer/pgbouncer>
+ * Read-Write / Read-Only 서버 분리
+ * Read-Only 서버 대상 Round-Robin 분산
+ * Read-Write 서버 대상 Priority 기반 선택
+ * PostgreSQL Role 기반 서버 검증 (Primary / Standby)
+ * Write 실패 시 안전한 fallback (연결 단계에서만)
+ * Routing 상태 조회용 Admin View 제공
 
-Building
+주의사항
+--------
+
+ * 본 기능은 PgBouncer 공식 버전에 존재하지 않는 커스텀 기능입니다.
+ * 반드시 패치된 바이너리에서만 동작합니다.
+ * 기본 PgBouncer에서는 설정 적용 시 오류 발생합니다.
+
+아키텍처
+--------
+
+Application은 Read / Write를 분리하여 접속해야 합니다.
+
+    Application
+      ├─ Write → PgBouncer(app_rw) → Primary
+      └─ Read  → PgBouncer(app_ro) → Replica (RR 분산)
+
+설정 방법
 ---------
 
-PgBouncer depends on few things to get compiled:
+1. server 그룹 정의
 
-* [GNU Make] 3.81+
-* [Libevent] 2.0+
-* [pkg-config]
-* [OpenSSL] 1.0.1+ for TLS support
-* (optional) [c-ares] as alternative to Libevent's evdns
-* (optional) LDAP libraries
-* (optional) PAM libraries
+    [server_groups]
+    appdb_rw = pg1,pg2
+    appdb_ro = pg3,pg4,pg5
 
-[GNU Make]: https://www.gnu.org/software/make/
-[Libevent]: http://libevent.org/
-[pkg-config]: https://www.freedesktop.org/wiki/Software/pkg-config/
-[OpenSSL]: https://www.openssl.org/
-[c-ares]: http://c-ares.haxx.se/
+2. 서버 등록
 
-When dependencies are installed just run:
+    [servers]
+    pg1 = host=10.0.1.11 port=5432 role=rw priority=1 enabled=1
+    pg2 = host=10.0.1.12 port=5432 role=rw priority=2 enabled=1
 
-    $ ./configure --prefix=/usr/local
-    $ make
-    $ make install
+    pg3 = host=10.0.2.11 port=5432 role=ro weight=1 enabled=1
+    pg4 = host=10.0.2.12 port=5432 role=ro weight=1 enabled=1
+    pg5 = host=10.0.2.13 port=5432 role=ro weight=1 enabled=1
 
-If you are building from Git, or are building for Windows, please see
-separate build instructions below.
+3. database routing 설정
 
-DNS lookup support
-------------------
+    [databases]
+    app_rw = dbname=appdb server_group=appdb_rw route=read-write role_check=read-write rw_fallback=connect_only pool_mode=transaction
+    app_ro = dbname=appdb server_group=appdb_ro route=read-only role_check=standby lb_policy=round-robin pool_mode=transaction
 
-PgBouncer does host name lookups at connect time instead of just once
-at configuration load time.  This requires an asynchronous DNS
-implementation.  The following table shows supported backends and
-their probing order:
+동작 방식
+---------
 
-| backend                    | parallel | EDNS0 (1) | /etc/hosts | SOA lookup (2) | note                                  |
-|----------------------------|----------|-----------|------------|----------------|---------------------------------------|
-| c-ares                     | yes      | yes       | yes        | yes            | IPv6+CNAME buggy in <=1.10            |
-| evdns, libevent 2.x        | yes      | no        | yes        | no             | does not check /etc/hosts updates     |
-| getaddrinfo_a, glibc 2.9+  | yes      | yes (3)   | yes        | no             | N/A on non-glibc                      |
-| getaddrinfo, libc          | no       | yes (3)   | yes        | no             | requires pthreads                     |
+Read 요청 (app_ro):
 
-1. EDNS0 is required to have more than 8 addresses behind one host name.
-2. SOA lookup is needed to re-check host names on zone serial change.
-3. To enable EDNS0, add `options edns0` to `/etc/resolv.conf`.
+ * Replica 대상 Round-Robin 분산
+ * 장애 서버 자동 제외
+ * Standby 여부 검증 후 사용
 
-c-ares is the most fully-featured implementation and is recommended
-for most uses and binary packaging (if a sufficiently new version is
-available).  Libevent's built-in evdns is also suitable for many uses,
-with the listed restrictions.  The other backends are mostly legacy
-options at this point and don't receive much testing anymore.
+Write 요청 (app_rw):
 
-By default, c-ares is used if it can be found.  Its use can be forced
-with `configure --with-cares` or disabled with `--without-cares`.  If
-c-ares is not used (not found or disabled), then Libevent is used.  Specify
-`--disable-evdns` to disable the use of Libevent's evdns and fall back to a
-libc-based implementation.
+ * Priority 기반 서버 선택 (1 → 2 → ...)
+ * Primary 여부 검증 후 사용
+ * 연결 실패 시 다음 후보로 fallback
 
-PAM authentication
-------------------
+Write Fallback 정책 (중요)
+-------------------------
 
-To enable PAM authentication, `./configure` has a flag `--with-pam`
-(default value is no).  When compiled with PAM support, a new global
-authentication type `pam` is available to validate users through PAM.
+Write fallback은 아래 경우에만 수행됩니다.
 
-LDAP authentication
-------------------
+ * 서버 connect 실패
+ * 로그인 실패
+ * role check 실패 (standby 연결된 경우)
 
-To enable LDAP authentication, `./configure` has a flag `--with-ldap`
-(default value is no).  When compiled with LDAP support, a new global
-authentication type `ldap` is available to validate users through LDAP.
+아래 경우에는 fallback 수행하지 않습니다.
 
-systemd integration
--------------------
+ * 쿼리가 이미 서버로 전송된 경우
+ * 트랜잭션이 시작된 경우
+ * commit 결과가 불확실한 경우
 
-To enable systemd integration, use the `configure` option
-`--with-systemd`.  This allows using `Type=notify` (or `Type=notify-reload` if
-you are using systemd 253 or later) as well as socket activation.  See
-`etc/pgbouncer.service` and `etc/pgbouncer.socket` for examples.
+이유:
 
-Building from Git
------------------
+ * 중복 INSERT/UPDATE 방지
+ * 트랜잭션 정합성 보장
+ * 데이터 손상 방지
 
-Building PgBouncer from Git requires that you generate the header and
-configuration files before you can run `configure`:
+운영 시나리오
+-------------
 
-	$ git clone https://github.com/pgbouncer/pgbouncer.git
-	$ cd pgbouncer
-	$ ./autogen.sh
-	$ ./configure
-	$ make
-	$ make install
+1. Primary 장애 발생
 
-All files will be installed under `/usr/local` by default. You can
-supply one or more command-line options to `configure`. Run
-`./configure --help` to list the available options and the environment
-variables that customizes the configuration.
+    pg1 DOWN
+    pg2 승격 (Primary)
 
-Additional packages required: autoconf, automake, libtool, pandoc
+    → Write는 pg2로 자동 연결
 
-Testing
--------
+2. Replica 일부 장애
 
-See the [`README.md` file in the test directory][1] on how to run the tests.
+    pg3 DOWN
 
-[1]: https://github.com/pgbouncer/pgbouncer/blob/master/test/README.md
+    → pg4, pg5로 자동 분산
 
-Building on Windows
--------------------
+3. Replica 전체 장애
 
-The only supported build environment on Windows is MinGW.  Cygwin and
-Visual $ANYTHING are not supported.
+    → Read 요청 실패 (Primary fallback 없음 - 권장 설정)
 
-To build on MinGW, do the usual:
+운영 명령어
+-----------
 
-	$ ./configure
-	$ make
+Routing 상태 조회:
 
-If cross-compiling from Unix:
+    SHOW SERVER_TARGETS;
+    SHOW SERVER_GROUPS;
+    SHOW ROUTE_STATS;
 
-	$ ./configure --host=i586-mingw32msvc
+서버 제어:
 
-The LDAP build option is currently not supported on Windows.
+    EXCLUDE TARGET appdb_rw pg1;
+    INCLUDE TARGET appdb_rw pg1;
 
-Running on Windows
-------------------
+    DRAIN TARGET appdb_ro pg3;
 
-Running from the command line goes as usual, except that the `-d` (daemonize),
-`-R` (reboot), and `-u` (switch user) switches will not work.
+설명:
 
-To run PgBouncer as a Windows service, you need to configure the
-`service_name` parameter to set a name for the service.  Then:
+ * EXCLUDE → 신규 연결 제외
+ * INCLUDE → 다시 포함
+ * DRAIN → 기존 연결 종료까지 대기 후 제거
 
-	$ pgbouncer -regservice config.ini
+권장 설정
+---------
 
-To uninstall the service:
+ * pool_mode = transaction
+ * rw_fallback = connect_only
+ * ro_fallback_to_primary = 0 (권장)
 
-	$ pgbouncer -unregservice config.ini
+주의할 점
+---------
 
-To use the Windows event log, set `syslog = 1` in the configuration file.
-But before that, you need to register `pgbevent.dll`:
+ * PgBouncer는 SQL을 분석하지 않음
+ * 반드시 애플리케이션에서 Read/Write 분리 필요
+ * Write fallback은 자동 재시도가 아님 (Application retry 필요)
 
-	$ regsvr32 pgbevent.dll
+한계
+----
 
-To unregister it, do:
+ * Multi-primary 구조 지원 안 함
+ * Query 기반 routing 미지원
+ * Transaction 중 failover 지원 안 함
 
-	$ regsvr32 /u pgbevent.dll
+결론
+----
+
+본 구조는 다음 목적에 적합합니다.
+
+ * PostgreSQL Primary + Replica 구조
+ * Read 부하 분산
+ * Primary 장애 시 빠른 연결 전환
+ * 최소한의 PgBouncer 변경으로 안정성 확보
