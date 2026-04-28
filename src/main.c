@@ -21,6 +21,7 @@
  */
 
 #include "bouncer.h"
+#include "rwro_pgbouncer.h"
 
 #include <usual/signal.h>
 #include <usual/err.h>
@@ -373,8 +374,14 @@ static const struct CfSect config_sects [] = {
 		.sect_name = "pgbouncer",
 		.key_list = bouncer_params,
 	}, {
+		.sect_name = "servers",
+		.set_key = rwro_parse_server,
+	}, {
+		.sect_name = "server_groups",
+		.set_key = rwro_parse_server_group,
+	}, {
 		.sect_name = "databases",
-		.set_key = parse_database,
+		.set_key = rwro_parse_database,
 	}, {
 		.sect_name = "users",
 		.set_key = parse_user,
@@ -466,6 +473,7 @@ bool load_config(void)
 	any_user_level_timeout_set = false;
 	empty_server_check_query = false;
 	any_user_level_client_timeout_set = false;
+	rwro_config_begin();
 
 	set_dbs_dead(true);
 	set_peers_dead(true);
@@ -476,11 +484,22 @@ bool load_config(void)
 		/* load users if needed */
 		if (requires_auth_file(cf_auth_type))
 			loader_users_check();
-		loaded = true;
-		ok = true;
+
+		if (!rwro_config_finish()) {
+			rwro_config_abort();
+			if (!loaded)
+				die("cannot load rw/ro routing config");
+			log_warning("rw/ro routing config loading failed, keeping previous routing config");
+			ok = false;
+		} else {
+			loaded = true;
+			ok = true;
+		}
 	} else if (!loaded) {
+		rwro_config_abort();
 		die("cannot load config file");
 	} else {
+		rwro_config_abort();
 		log_warning("config file loading failed");
 		/* if ini file missing, don't kill anybody */
 		set_dbs_dead(false);
@@ -967,6 +986,7 @@ static void cleanup(void)
 	ident_free(parsed_ident);
 	parsed_ident = NULL;
 
+	rwro_config_cleanup();
 	admin_cleanup();
 	objects_cleanup();
 	sbuf_cleanup();
@@ -1096,6 +1116,7 @@ int main(int argc, char *argv[])
 #endif
 
 	init_objects();
+	rwro_config_setup();
 	load_config();
 	main_config.loaded = true;
 	init_var_lookup(cf_track_extra_parameters);
