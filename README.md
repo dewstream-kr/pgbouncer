@@ -48,7 +48,7 @@ Application은 Read / Write를 분리하여 접속해야 합니다.
     pg4 = host=10.0.2.12 port=5432 role=ro weight=1 enabled=1
     pg5 = host=10.0.2.13 port=5432 role=ro weight=1 enabled=1
 
-3. database routing 설정
+4. database routing 설정
 
     [databases]
     app_rw = dbname=appdb server_group=appdb_rw route=read-write role_check=read-write rw_fallback=connect_only pool_mode=transaction
